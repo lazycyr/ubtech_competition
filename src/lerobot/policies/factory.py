@@ -44,6 +44,8 @@ from src.lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from src.lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from src.lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from src.lerobot.processor import PolicyAction, PolicyProcessorPipeline
+from src.lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+from src.lerobot.policies.pi05.processor_pi05 import Pi0StyleNewlineStep, Pi05PrepareStateTokenizerProcessorStep
 from src.lerobot.processor.converters import (
     batch_to_transition,
     policy_action_to_transition,
@@ -56,6 +58,27 @@ from src.lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+
+def _reconnect_relative_absolute_steps(
+    preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
+) -> None:
+    relative_step = next(
+        (step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)), None
+    )
+    if relative_step is None:
+        return
+    for step in postprocessor.steps:
+        if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
+            step.relative_step = relative_step
+
+
+def _configure_pi05_prompt_step(policy_cfg: PI05Config, preprocessor: PolicyProcessorPipeline) -> None:
+    for index, step in enumerate(preprocessor.steps):
+        if isinstance(step, Pi05PrepareStateTokenizerProcessorStep) and not policy_cfg.discrete_state_input:
+            preprocessor.steps[index] = Pi0StyleNewlineStep(task_key=step.task_key)
+        elif isinstance(step, Pi0StyleNewlineStep) and policy_cfg.discrete_state_input:
+            preprocessor.steps[index] = Pi05PrepareStateTokenizerProcessorStep(task_key=step.task_key)
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -263,26 +286,28 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
-        return (
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
-                to_output=transition_to_batch,
+        preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("postprocessor_overrides", {}),
-                to_transition=policy_action_to_transition,
-                to_output=transition_to_policy_action,
-            ),
+            overrides=kwargs.get("preprocessor_overrides", {}),
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
         )
+        postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+            ),
+            overrides=kwargs.get("postprocessor_overrides", {}),
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        )
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, PI05Config):
+            _configure_pi05_prompt_step(policy_cfg, preprocessor)
+        return preprocessor, postprocessor
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):
@@ -548,7 +573,12 @@ def make_policy(
             )
 
         policy = policy_cls.from_pretrained(**kwargs)
-        policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
+        # is_trainable=True so the loaded adapters and modules_to_save keep requires_grad=True.
+        # peft's default (False) freezes everything, which makes the optimizer empty and
+        # backward() fails with "element 0 of tensors does not require grad" when resuming training.
+        policy = PeftModel.from_pretrained(
+            policy, peft_pretrained_path, config=peft_config, is_trainable=True
+        )
 
         # Re-apply dataset visual features after from_pretrained re-parses config from disk
         dataset_visuals = {k: v for k, v in features.items() if v.type is FeatureType.VISUAL}

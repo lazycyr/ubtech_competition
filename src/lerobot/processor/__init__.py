@@ -75,6 +75,12 @@ from .policy_robot_bridge import (
     RobotActionToPolicyActionProcessorStep,
 )
 from .rename_processor import RenameObservationsProcessorStep
+from .relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+    to_absolute_actions,
+    to_relative_actions,
+)
 from .state_slicer_processor import StateSlicerProcessorStep, slice_stats_for_state
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
@@ -114,6 +120,10 @@ __all__ = [
     "RobotAction",
     "RobotActionProcessorStep",
     "RobotObservation",
+    "RelativeActionsProcessorStep",
+    "AbsoluteActionsProcessorStep",
+    "to_relative_actions",
+    "to_absolute_actions",
     "RenameObservationsProcessorStep",
     "slice_stats_for_state",
     "StateSlicerProcessorStep",

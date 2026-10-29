@@ -54,6 +54,7 @@ htmlcov/
 
 # Hugging Face / 本地下载
 resources/
+pretrained/
 weight/*
 !weight/.gitkeep
 !weight/README.md
@@ -93,6 +94,7 @@ tests/outputs/
 # 其他
 *.log
 .cache/
+pic/
 docs/
 *.json
 .codex

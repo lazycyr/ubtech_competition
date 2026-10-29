@@ -49,6 +49,9 @@ RUN /isaac-sim/python.sh -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
     "pymunk>=6.6.0" \
     "pyzmq>=26.2.1" \
     "termcolor>=2.4.0" \
+    "pyserial>=3.5,<4.0" \
+    "rerun-sdk>=0.24.0,<0.27.0" \
+    "peft>=0.18.0,<1.0.0" \
     "wandb>=0.16.3" \
     "zarr>=2.17.0" \
     "safetensors" \
@@ -57,7 +60,7 @@ RUN /isaac-sim/python.sh -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
     "pin" \
     "numpy<1.27,>=1.22" \
     "transformers>=4.48.0" \
-    "accelerate" \
+    "accelerate>=1.10.0,<2.0.0" \
     "num2words" \
     "pytest>=8.1.0" \
     && /isaac-sim/python.sh -m pip install --no-cache-dir -i ${PIP_INDEX_URL} --no-deps "pynput>=1.7.7"

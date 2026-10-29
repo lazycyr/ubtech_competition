@@ -71,6 +71,45 @@ class EvalConfig:
 
 
 @dataclass
+class OfflineEvalConfig:
+    # Held-out flow-matching loss *during* training, without a simulator. `lerobot_train.py` only evaluates
+    # through `cfg.env`, so an offline run otherwise gets no held-out signal until it has finished and
+    # `lerobot_validate_offline` is run over its checkpoints.
+    enable: bool = False
+
+    # Parent dataset holding the unseen episodes, and which of them to score. Both are required: datasets
+    # under `datasets/` are prefixes of each other, so picking the wrong range silently scores training
+    # frames and the loss stops meaning anything.
+    dataset_root: str | None = None
+    dataset_repo_id: str | None = None
+    val_episodes: str = ""
+
+    # Frames drawn from those episodes. Subsampled with `seed` by the same function
+    # `lerobot_validate_offline` uses, so the curve logged during training lines up with a later run of
+    # that script over the same checkpoints.
+    max_samples: int = 1024
+    batch_size: int = 16
+
+    # Evaluations run on the main process only. `num_workers` must stay above zero: the training
+    # dataloader already has its own decoding workers, and `LeRobotDataset._query_videos` warns that
+    # decoding in the main process alongside them segfaults.
+    num_workers: int = 4
+
+    # Steps between evaluations. 0 follows `save_freq`, which keeps the curve aligned with checkpoints.
+    freq: int = 0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.enable and (not self.dataset_root or not self.val_episodes):
+            raise ValueError(
+                "offline_eval.enable requires both --offline_eval.dataset_root and "
+                "--offline_eval.val_episodes, e.g. --offline_eval.dataset_root=datasets/Part_Sorting_1000/selected "
+                "--offline_eval.val_episodes=300-999. Leaving `val_episodes` empty would score every episode of "
+                "the val dataset, including any the policy was trained on."
+            )
+
+
+@dataclass
 class PeftConfig:
     # PEFT offers many fine-tuning methods, layer adapters being the most common and currently also the most
     # effective methods so we'll focus on those in this high-level config interface.

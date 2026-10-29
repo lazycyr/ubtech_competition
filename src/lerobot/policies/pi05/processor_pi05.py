@@ -26,11 +26,13 @@ from src.lerobot.policies.pi05.configuration_pi05 import PI05Config
 from src.lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    AbsoluteActionsProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     StateSlicerProcessorStep,
     TokenizerProcessorStep,
@@ -94,6 +96,29 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register(name="pi0_style_newline_step")
+@dataclass
+class Pi0StyleNewlineStep(ProcessorStep):
+    """Append a newline to the task text without adding state tokens."""
+
+    task_key: str = "task"
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+        tasks = complementary_data.get(self.task_key)
+        if tasks is not None:
+            transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = [
+                f"{task.strip().replace('_', ' ').replace(chr(10), ' ')}\n" for task in tasks
+            ]
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 def make_pi05_pre_post_processors(
     config: PI05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -127,10 +152,16 @@ def make_pi05_pre_post_processors(
     """
 
     # Add remaining processors
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=config.relative_exclude_joints,
+        action_names=config.action_feature_names,
+    )
     input_steps: list[ProcessorStep] = [
         StateSlicerProcessorStep(n_dims=20),
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        relative_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -138,7 +169,11 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        (
+            Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim)
+            if config.discrete_state_input
+            else Pi0StyleNewlineStep()
+        ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
@@ -152,6 +187,7 @@ def make_pi05_pre_post_processors(
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
 

@@ -27,15 +27,16 @@ import logging
 import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 
-import datasets
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
+import datasets
 from src.lerobot.datasets.aggregate import aggregate_datasets
 from src.lerobot.datasets.compute_stats import aggregate_stats
 from src.lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -145,6 +146,7 @@ def split_dataset(
     dataset: LeRobotDataset,
     splits: dict[str, float | list[int]],
     output_dir: str | Path | None = None,
+    vcodec: str = "h264",
 ) -> dict[str, LeRobotDataset]:
     """Split a LeRobotDataset into multiple smaller datasets.
 
@@ -153,6 +155,8 @@ def split_dataset(
         splits: Either a dict mapping split names to episode indices, or a dict mapping
                 split names to fractions (must sum to <= 1.0).
         output_dir: Root directory where the split datasets will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id.
+        vcodec: Codec used to re-encode video files that hold a mix of kept and dropped
+                episodes. Files kept in full are copied verbatim.
 
     Examples:
       Split by specific episodes
@@ -213,7 +217,7 @@ def split_dataset(
 
         video_metadata = None
         if dataset.meta.video_keys:
-            video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
+            video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping, vcodec=vcodec)
 
         data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
 
@@ -374,6 +378,129 @@ def modify_features(
     )
 
     return new_dataset
+
+
+def slice_vector_feature(
+    dataset: LeRobotDataset,
+    feature_name: str,
+    start: int,
+    stop: int,
+    output_dir: str | Path,
+    repo_id: str,
+) -> LeRobotDataset:
+    """Create a dataset with one vector feature sliced along its last dimension."""
+    if feature_name not in dataset.meta.features:
+        raise ValueError(f"Feature '{feature_name}' not found in dataset")
+    if start < 0 or stop <= start:
+        raise ValueError(f"Invalid slice [{start}:{stop}]")
+
+    feature = dataset.meta.features[feature_name]
+    if len(feature["shape"]) != 1:
+        raise ValueError(f"Feature '{feature_name}' must be one-dimensional, got {feature['shape']}")
+    if stop > feature["shape"][0]:
+        raise ValueError(
+            f"Slice [{start}:{stop}] exceeds feature '{feature_name}' size {feature['shape'][0]}"
+        )
+
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(f"Output directory already exists: {output_dir}")
+
+    features = deepcopy(dataset.meta.features)
+    features[feature_name]["shape"] = [stop - start]
+    if features[feature_name].get("names") is not None:
+        features[feature_name]["names"] = features[feature_name]["names"][start:stop]
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(dataset.meta.video_keys) > 0,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    try:
+        parquet_files = sorted((dataset.root / DATA_DIR).glob("*/*.parquet"))
+        if not parquet_files:
+            raise ValueError(f"No parquet files found in {dataset.root / DATA_DIR}")
+
+        for src_path in tqdm(parquet_files, desc=f"Slicing {feature_name}"):
+            df = pd.read_parquet(src_path)
+            df[feature_name] = df[feature_name].map(
+                lambda value: np.asarray(value, dtype=np.float32)[start:stop]
+            )
+            dst_path = output_dir / src_path.relative_to(dataset.root)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_parquet(df, dst_path, new_meta)
+
+        if dataset.meta.video_keys:
+            _copy_videos(dataset, new_meta)
+
+        _copy_episodes_metadata_and_stats(dataset, new_meta)
+        _slice_episode_feature_stats(new_meta, feature_name=feature_name, start=start, stop=stop)
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+
+def _slice_episode_feature_stats(
+    meta: LeRobotDatasetMetadata,
+    feature_name: str,
+    start: int,
+    stop: int,
+) -> None:
+    """Slice per-episode feature statistics and rebuild dataset statistics."""
+    stats_prefix = f"stats/{feature_name}/"
+    all_stats = []
+
+    for path in sorted((meta.root / "meta/episodes").glob("*/*.parquet")):
+        df = pd.read_parquet(path)
+        stat_columns = [column for column in df.columns if column.startswith(stats_prefix)]
+        for column in stat_columns:
+            if column == f"{stats_prefix}count":
+                continue
+            df[column] = df[column].map(lambda value: np.asarray(value)[start:stop])
+
+        for _, row in df.iterrows():
+            episode_stats = {}
+            for column in (column for column in df.columns if column.startswith("stats/")):
+                _, current_feature, stat_name = column.split("/", maxsplit=2)
+                value = row[column]
+                if (
+                    current_feature in meta.features
+                    and meta.features[current_feature]["dtype"] in ["image", "video"]
+                    and stat_name != "count"
+                ):
+                    if isinstance(value, np.ndarray) and value.dtype == object:
+                        flat_values = []
+                        for item in value:
+                            while isinstance(item, np.ndarray):
+                                item = item.flatten()[0]
+                            flat_values.append(item)
+                        value = np.asarray(flat_values, dtype=np.float64).reshape(3, 1, 1)
+                    elif isinstance(value, np.ndarray) and value.shape == (3,):
+                        value = value.reshape(3, 1, 1)
+                episode_stats.setdefault(current_feature, {})[stat_name] = value
+            all_stats.append(episode_stats)
+
+        df.to_parquet(path, index=False)
+
+    if not all_stats:
+        raise ValueError(f"No episode statistics found in {meta.root}")
+
+    write_stats(aggregate_stats(all_stats), meta.root)
 
 
 def add_features(

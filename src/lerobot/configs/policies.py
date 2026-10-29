@@ -161,8 +161,19 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
+        # ``type`` is a registry-derived property rather than a dataclass field, so
+        # draccus does not serialize it automatically. Keep it in the checkpoint
+        # config because ``from_pretrained`` uses it to select the policy subclass.
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
+            f.flush()
+            f.seek(0)
+            config = json.load(f)
+
+        config["type"] = self.type
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(config, f, indent=4)
+            f.write("\n")
 
     @classmethod
     def from_pretrained(

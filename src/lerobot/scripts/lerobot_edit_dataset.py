@@ -160,9 +160,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import datasets
 import draccus
 
+import datasets
 from src.lerobot.configs import parser
 from src.lerobot.datasets.dataset_tools import (
     convert_image_to_video_dataset,
@@ -170,6 +170,7 @@ from src.lerobot.datasets.dataset_tools import (
     merge_datasets,
     modify_tasks,
     remove_feature,
+    slice_vector_feature,
     split_dataset,
 )
 from src.lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -195,6 +196,7 @@ class DeleteEpisodesConfig(OperationConfig):
 @dataclass
 class SplitConfig(OperationConfig):
     splits: dict[str, float | list[int]] | None = None
+    vcodec: str = "h264"
 
 
 @OperationConfig.register_subclass("merge")
@@ -208,6 +210,14 @@ class MergeConfig(OperationConfig):
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("slice_vector_feature")
+@dataclass
+class SliceVectorFeatureConfig(OperationConfig):
+    feature_name: str = "observation.state"
+    start: int = 0
+    stop: int | None = None
 
 
 @OperationConfig.register_subclass("modify_tasks")
@@ -291,9 +301,7 @@ def enforce_dataset_data_types(dataset: LeRobotDataset) -> bool:
         logging.warning(f"No parquet files found under {data_dir}. Skipping type enforcement.")
         return False
 
-    logging.info(
-        f"Checking data types for dataset {dataset.repo_id} ({len(parquet_files)} parquet files)"
-    )
+    logging.info(f"Checking data types for dataset {dataset.repo_id} ({len(parquet_files)} parquet files)")
 
     files_converted = 0
 
@@ -393,6 +401,7 @@ def handle_split(cfg: EditDatasetConfig) -> None:
         dataset,
         splits=cfg.operation.splits,
         output_dir=cfg.new_root,
+        vcodec=cfg.operation.vcodec,
     )
 
     for split_name, split_ds in split_datasets.items():
@@ -454,11 +463,10 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     logging.info(
         f"Episodes: {merged_dataset.meta.total_episodes}, Frames: {merged_dataset.meta.total_frames}"
     )
-    
+
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {cfg.new_repo_id}")
         LeRobotDataset(merged_dataset.repo_id, root=output_dir).push_to_hub()
-
 
 
 def handle_remove_feature(cfg: EditDatasetConfig) -> None:
@@ -494,6 +502,43 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_slice_vector_feature(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, SliceVectorFeatureConfig):
+        raise ValueError("Operation config must be SliceVectorFeatureConfig")
+    if cfg.operation.stop is None:
+        raise ValueError("--operation.stop is required for slice_vector_feature operation")
+    if cfg.new_repo_id is None and cfg.new_root is None:
+        raise ValueError(
+            "slice_vector_feature requires --new_repo_id or --new_root to avoid modifying the input dataset"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id = cfg.new_repo_id or cfg.repo_id
+    output_dir = Path(cfg.new_root) if cfg.new_root else HF_LEROBOT_HOME / output_repo_id
+    if output_dir.resolve() == dataset.root.resolve():
+        raise ValueError("slice_vector_feature does not support in-place modification")
+
+    logging.info(
+        f"Slicing feature {cfg.operation.feature_name}[{cfg.operation.start}:{cfg.operation.stop}] "
+        f"from {cfg.repo_id}"
+    )
+    new_dataset = slice_vector_feature(
+        dataset=dataset,
+        feature_name=cfg.operation.feature_name,
+        start=cfg.operation.start,
+        stop=cfg.operation.stop,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Feature schema: {new_dataset.meta.features[cfg.operation.feature_name]}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
 
 
 def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
@@ -667,6 +712,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "slice_vector_feature":
+        handle_slice_vector_feature(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":

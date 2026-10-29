@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import builtins
-import copy
 import logging
 import math
 from collections import deque
@@ -30,6 +29,7 @@ from src.lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers.cache_utils import DynamicCache
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
 
@@ -137,6 +137,15 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     return att_2d_masks & pad_2d_masks
 
 
+def clone_past_key_values(past_key_values):
+    """Clone the DynamicCache returned by prefix prefill for compiled denoising."""
+    return DynamicCache(
+        tuple(
+            (keys.clone(), values.clone(), sliding_window) for keys, values, sliding_window in past_key_values
+        )
+    )
+
+
 def pad_vector(vector, new_dim):
     """Pad the last dimension of a vector to new_dim with zeros.
 
@@ -223,16 +232,13 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 
 
 # Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(
-    layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
-):
-    models = [paligemma.model.language_model, gemma_expert.model]
+def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
     query_states = []
     key_states = []
     value_states = []
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
+        layer = layers[i]
         hidden_states, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond[i])
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
@@ -254,15 +260,16 @@ def compute_layer_complete(
         device=query_states.device,
         dtype=query_states.dtype,
     )
-    cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+    cos, sin = rotary_emb(dummy_tensor, position_ids)
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
     batch_size = query_states.shape[0]
-    scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
+    paligemma_layer = layers[0]
+    scaling = paligemma_layer.self_attn.scaling
     # Attention computation
     att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.model.language_model.layers[layer_idx].self_attn,
+        paligemma_layer.self_attn,
         query_states,
         key_states,
         value_states,
@@ -270,13 +277,13 @@ def compute_layer_complete(
         scaling,
     )
     # Get head_dim from the current layer, not from the model
-    head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
+    head_dim = paligemma_layer.self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
+        layer = layers[i]
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
@@ -440,13 +447,17 @@ class PaliGemmaWithExpertModel(
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
         image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        # transformers 4.x returns the projected features as a plain Tensor,
+        # while 5.x wraps them in an object with `.pooler_output`. Handle both.
+        features = (
+            image_outputs.pooler_output if hasattr(image_outputs, "pooler_output") else image_outputs
+        )
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.model.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -484,8 +495,9 @@ class PaliGemmaWithExpertModel(
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.model.language_model, self.gemma_expert.model]
-            num_layers = self.paligemma.config.text_config.num_hidden_layers
+            paligemma_layers = self.paligemma.model.language_model.layers
+            gemma_expert_layers = self.gemma_expert.model.layers
+            rotary_emb = self.paligemma.model.language_model.rotary_emb
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
@@ -494,37 +506,38 @@ class PaliGemmaWithExpertModel(
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
-            # Process all layers with gradient checkpointing if enabled
-            for layer_idx in range(num_layers):
+            for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
-                        layer_idx,
                         inputs_embeds,
                         attention_mask,
                         position_ids,
                         adarms_cond,
                         use_reentrant=False,
                         preserve_rng_state=False,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
+                        layers=layers,
+                        rotary_emb=rotary_emb,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
-                        layer_idx,
                         inputs_embeds,
                         attention_mask,
                         position_ids,
                         adarms_cond,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
+                        layers=layers,
+                        rotary_emb=rotary_emb,
                     )
 
             # final norm
+            final_norms = (
+                self.paligemma.model.language_model.norm,
+                self.gemma_expert.model.norm,
+            )
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = layernorm_forward(models[i].norm, hidden_states, adarms_cond[i])
+                    out_emb, _ = layernorm_forward(final_norms[i], hidden_states, adarms_cond[i])
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -886,7 +899,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        past_key_values = copy.deepcopy(past_key_values)
+        past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1096,11 +1109,10 @@ class PI05Policy(PreTrainedPolicy):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
-
+             #Handle vision tower embedding layer potential differences
+            if "vision_tower.vision_model." in key:
+                new_key = key.replace("vision_tower.vision_model.", "vision_tower.")
+                
             if (
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"
                 or key == "paligemma_with_expert.paligemma.lm_head.weight"
@@ -1260,8 +1272,9 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
 
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        noise = self.model.sample_noise(actions.shape, actions.device)
+        time = self.model.sample_time(actions.shape[0], actions.device)
+        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1284,9 +1297,55 @@ class PI05Policy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+        config = getattr(self, "config", None)
+        profile = getattr(config, "lora_target_profile", "default")
+
+        action_expert_modules = (
+            r"gemma_expert\.model\.layers\.\d+"
+            r"\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
         )
+        common_projections = (
+            "state_proj|action_in_proj|action_out_proj|time_mlp_in|time_mlp_out|"
+            "action_time_mlp_in|action_time_mlp_out"
+        )
+
+        if profile in ("openpi", "openpi_frozen_vision"):
+            paligemma_modules = (
+                r"paligemma\.model\.language_model\.layers\.\d+"
+                r"\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+            )
+            modules_to_save = ["action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"]
+            if profile == "openpi":
+                # `openpi` trains the vision tower in full: ~412M of the ~448M parameters its
+                # adapters make trainable. `openpi_frozen_vision` keeps the proven LoRA coverage --
+                # language model and action expert at the same ranks -- and leaves only the image
+                # encoder frozen. It is the thing to try when a few hundred episodes overfit
+                # (train loss collapses, held-out loss climbs) under plain `openpi`.
+                modules_to_save.insert(0, "vision_tower")
+            return {
+                "target_modules": rf".*\.({paligemma_modules}|{action_expert_modules})$",
+                "rank_pattern": {
+                    r"paligemma\.model\..*": 16,
+                    r"gemma_expert\..*": 32,
+                },
+                "alpha_pattern": {
+                    r"paligemma\.model\..*": 16,
+                    r"gemma_expert\..*": 32,
+                },
+                "modules_to_save": modules_to_save,
+            }
+
+        if profile == "expert":
+            # LoRA across the action expert -- the only part that produces actions -- plus the small
+            # action/state projections, leaving the VLM on its pretrained grounding. `openpi` adapts
+            # the same expert layers, but also puts LoRA on the language model and fully re-trains
+            # the vision tower; that tower alone is ~412M of the 448M parameters `openpi` makes
+            # trainable, which on a few hundred episodes goes into memorising them instead of the task.
+            return {
+                "target_modules": rf".*\.({action_expert_modules}|{common_projections})$",
+                "modules_to_save": [],
+            }
+
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

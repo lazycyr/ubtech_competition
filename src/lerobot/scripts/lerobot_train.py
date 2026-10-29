@@ -41,6 +41,11 @@ from src.lerobot.rl.wandb_utils import WandBLogger
 from src.lerobot.scripts.lerobot_eval import eval_policy_all
 from src.lerobot.utils.import_utils import register_third_party_plugins
 from src.lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from src.lerobot.utils.offline_eval import (
+    append_offline_eval_row,
+    build_offline_val_loader,
+    compute_offline_val_loss,
+)
 from src.lerobot.utils.random_utils import set_seed
 from src.lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -244,7 +249,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         rename_map=cfg.rename_map,
     )
 
-    if cfg.peft is not None:
+    # On resume, the policy is loaded entirely by make_policy (config from the checkpoint,
+    # including the PEFT adapter when use_peft is true). Wrapping again would inject a second
+    # set of fresh LoRA adapters and discard the loaded ones, so skip it.
+    if cfg.peft is not None and not cfg.resume:
         logging.info("Using PEFT! Wrapping model.")
         # Convert CLI peft config to dict for overrides
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
@@ -376,6 +384,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # Held-out loss, measured on the main process only: it is purely a monitoring signal, so the other
+    # ranks reach the barrier in the loop below having done no extra work. Built here rather than lazily
+    # so a bad root or episode range fails at startup instead of thousands of steps in.
+    offline_val_loader = None
+    offline_eval_freq = cfg.offline_eval.freq or cfg.save_freq
+    if cfg.offline_eval.enable and is_main_process:
+        logging.info("Creating held-out dataset for offline evaluation")
+        offline_val_loader, offline_val_info = build_offline_val_loader(cfg, device)
+        val_episodes = offline_val_info["episodes"]
+        logging.info(
+            f"Offline eval: {offline_val_info['frames']} frames from {len(val_episodes)} episodes "
+            f"({val_episodes[0]}..{val_episodes[-1]}) of {offline_val_info['root']}, "
+            f"every {offline_eval_freq} steps"
+        )
+        logging.info(
+            f"  training set for comparison: {cfg.dataset.root} (episodes {cfg.dataset.episodes or 'all'})"
+            " -- check the two episode ranges do not overlap"
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
@@ -443,13 +470,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        # Computed on every rank so the barrier below stays collective.
+        is_offline_eval_step = (
+            cfg.offline_eval.enable and offline_eval_freq > 0 and step % offline_eval_freq == 0
+        )
 
         if is_log_step:
             logging.info(train_tracker)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
+                wandb_log_dict["batch_loss"] = train_tracker.metrics["loss"].val
                 if output_dict:
-                    wandb_log_dict.update(output_dict)
+                    # Keep train/loss as the interval average shown in the terminal.
+                    wandb_log_dict.update({key: value for key, value in output_dict.items() if key != "loss"})
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
@@ -481,6 +514,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
+            accelerator.wait_for_everyone()
+
+        if is_offline_eval_step:
+            if is_main_process:
+                try:
+                    val_loss, val_std, val_n = compute_offline_val_loss(
+                        accelerator.unwrap_model(policy),
+                        preprocessor,
+                        offline_val_loader,
+                        accelerator,
+                        cfg.offline_eval.seed,
+                    )
+                except Exception:
+                    # A monitoring signal must not take down a run that is otherwise healthy. The
+                    # traceback is loud, so a recurring failure reads as a recurring hole in the curve
+                    # rather than as a silently flat one.
+                    logging.exception(f"Offline eval after step {step} failed; skipping it")
+                else:
+                    logging.info(
+                        f"Offline held-out loss after step {step}: {val_loss:.6f} "
+                        f"(std {val_std:.6f}, n={val_n})"
+                    )
+                    if wandb_logger:
+                        wandb_logger.log_dict(
+                            {"offline_val/loss": val_loss, "offline_val/std": val_std},
+                            step,
+                            mode="eval",
+                        )
+                    append_offline_eval_row(cfg.output_dir, step, val_loss, val_std, val_n)
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:

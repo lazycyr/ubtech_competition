@@ -24,7 +24,13 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from src.lerobot import envs
 from src.lerobot.configs import parser
-from src.lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
+from src.lerobot.configs.default import (
+    DatasetConfig,
+    EvalConfig,
+    OfflineEvalConfig,
+    PeftConfig,
+    WandBConfig,
+)
 from src.lerobot.configs.policies import PreTrainedConfig
 from src.lerobot.optim import OptimizerConfig
 from src.lerobot.optim.schedulers import LRSchedulerConfig
@@ -67,6 +73,9 @@ class TrainPipelineConfig(HubMixin):
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
+    # Held-out loss measured on a fixed set of frames while training runs, so a rising curve can be
+    # spotted long before the run ends. Disabled by default.
+    offline_eval: OfflineEvalConfig = field(default_factory=OfflineEvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
 
